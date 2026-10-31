@@ -1,0 +1,208 @@
+---
+title: "AIHW Dementia Prevalence"
+format: html
+author: Novhita Paembonan
+date: October 2026
+editor: visual
+---
+
+```{r include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+## Libraries
+
+```{r libraries, include=TRUE, warning=FALSE}
+
+# Load libraries
+library(readxl)
+library(here)
+library(janitor)
+library(tidyverse)
+library(corrplot)
+library(sf)
+library(tmap)
+library(leaflet)
+```
+
+## Dataset Cleaning
+
+### Dementia Dataset
+
+```{r dementia_dataset}
+
+# Read the dataset
+aihw_data <- read_excel(here("Data", "aihw_dementia_prev.xlsx"), 
+                         sheet = 10,
+                         na = c("", "NA", "^", "..", "...", "n.p.")) %>%
+  clean_names()
+
+# View the first five rows in the dataset
+head(aihw_data)
+
+colnames(aihw_data)
+```
+
+```{r check_duplicate_for_PHA}
+
+# Checking PHA code duplicate
+duplicate_name <- aihw_data %>%
+  filter(duplicated(sa2_name) | duplicated(sa2_name, fromLast=TRUE)) %>%
+  nrow()
+
+duplicate_name
+```
+
+### PHA Dataset
+
+Load the PHA Dataset to be used for further analysis
+
+```{r pha_dataset}
+# read the PHA file
+pha_path <- here("Data", "sa2_to_pha.xlsx")
+
+# Read the PHA dataset
+pha_data <- read_excel(pha_path, sheet = 1) %>% 
+  clean_names()
+
+head(pha_data)
+```
+
+```{r}
+# add the sa2 code from pha_data to aihw_data
+sa2_lookup <- pha_data %>%
+  select(sa2_name, sa2_code) %>%
+  distinct()
+
+aihw_data <- aihw_data %>%
+  left_join(sa2_lookup, by = c("sa2_name" = "sa2_name"))
+
+# Cek hasil beberapa baris teratas
+head(aihw_data)
+```
+
+## Population
+
+ABS ASGS Ed3 SA2 2021 Regional population by age and sex 2024 (Digital Atlas of Australia)
+
+```{r}
+aihw_pop <- read_excel(here("Data", "AIHW_pop.xlsx"),
+                       sheet = 1,
+                       na = c("", "NA", "^", "..", "...", "n.p.")) %>%   
+  clean_names()
+```
+
+```{r}
+# Add total persons from aihw_pop to aihw data
+
+aihw_data <- aihw_data %>%
+  mutate(sa2_code = as.character(sa2_code))
+
+pop_lookup <- aihw_pop %>%
+  select(sa2_code, total_persons) %>%
+  distinct(sa2_code, .keep_all = TRUE)
+
+aihw_data <- aihw_data %>%
+  left_join(pop_lookup, by = "sa2_code")
+
+head(aihw_data)
+colnames(aihw_data)
+```
+
+## SA2 to PHA
+
+```{r}
+
+# Create a lookup table for PHA and SA2 mapping from pha_data
+pha_lookup <- pha_data %>%
+  mutate(sa2_code = as.character(sa2_code)) %>%
+  select(sa2_code, 
+         pha_code = pha_code, 
+         pha_name = pha_name) %>%
+  distinct(sa2_code, .keep_all = TRUE)
+
+# Aggregate counts and population from SA2 to PHA level
+aihw_data <- aihw_data %>%
+  mutate(sa2_code = as.character(sa2_code)) %>%
+  left_join(pha_lookup, by = "sa2_code") %>%
+  group_by(pha_code, pha_name) %>%
+  summarise(
+    total_dementia_cases_aihw = sum(persons, na.rm = TRUE),
+    total_pop = sum(total_persons, na.rm = TRUE),
+    .groups = "drop") %>%
+  # Dementia prevalence
+  mutate(
+    aihw_dementia_rate = (total_dementia_cases_aihw / total_pop) * 100
+  )
+
+# Check the first few rows of the aggregated PHA dataset
+head(aihw_data)
+```
+
+## PHA Map Final Dataset
+
+```{r}
+comb_paf <- readRDS(here("combined_paf.rds"))
+```
+
+```{r}
+comb_paf <- comb_paf %>%
+  mutate(pha_code = as.character(pha_code))
+
+aihw_data <- aihw_data %>%
+  mutate(pha_code = as.character(pha_code))
+
+# Join AIHW dementia rate with the Combined PAF dataset
+combined_data <- comb_paf %>%
+  left_join(aihw_data %>% select(pha_code,
+                                 aihw_dementia_rate,
+                                 total_dementia_cases_aihw),
+            by = "pha_code")
+
+```
+
+### Correlation Check
+
+```{r}
+# Extract correlation variables clean of spatial geometry and vector names
+cor_vars <- combined_data %>%
+  st_drop_geometry() %>%
+  as_tibble() %>%
+  mutate(
+    combined_paf_add_smooth = as.numeric(as.vector(combined_paf_add_smooth)),
+    aihw_dementia_rate = as.numeric(as.vector(aihw_dementia_rate))
+  ) %>%
+  select(combined_paf_add_smooth, aihw_dementia_rate) %>%
+  drop_na()
+
+# Compute Pearson and Spearman correlation matrices
+pearson_corr <- cor(cor_vars, method = "pearson")
+spearman_corr <- cor(cor_vars, method = "spearman")
+
+cat("--- Pearson Correlation Matrix ---\n")
+print(round(pearson_corr, 3))
+
+cat("\n--- Spearman Correlation Matrix ---\n")
+print(round(spearman_corr, 3))
+
+
+```
+
+```{r}
+# Scatterplot: Combined PAF vs. AIHW Dementia Rate
+ggplot(combined_data, aes(x = combined_paf_add_smooth, 
+                          y = aihw_dementia_rate)) +
+  geom_point(alpha = 0.4, color = "#2b5c8f") +
+  geom_smooth(method = "lm", color = "#d95f02", se = TRUE) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Combined PAF (Additive) vs AIHW Modelled Dementia Rate",
+    subtitle = "Aggregated at Population Health Area (PHA) Level",
+    x = "Combined PAF (%)",
+    y = "AIHW Modelled Dementia Prevalence (%)"
+  )
+```
+
+-   **Positive Correlation:** Both Pearson (r = 0.222) and Spearman (p = 0.257) indicate a weak-to-moderate positive relationship, showing that areas with a higher *Combined PAF* tend to have higher AIHW dementia prevalence.
+
+-   **Scatter Plot:** The upward trendline confirms the positive association, while the broad data dispersion reflects small-area variability, demonstrating that modifiable risk factors provide complementary spatial variation alongside baseline demographic rates.
